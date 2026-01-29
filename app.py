@@ -5,80 +5,61 @@ from datetime import date, datetime
 from PIL import Image
 from io import BytesIO
 
-# --------------------------------------------------
-# Page config
-# --------------------------------------------------
-st.set_page_config(
-    page_title="Iron Condor Dashboard",
-    layout="wide"
-)
+st.set_page_config(page_title="Iron Condor Dashboard", layout="wide")
 
-# --------------------------------------------------
-# Simple styling (NO emojis)
-# --------------------------------------------------
 st.markdown("""
 <style>
 .block-container { padding-top: 1rem; }
-.kpi {
-    border: 1px solid rgba(200,200,200,0.25);
-    border-radius: 14px;
-    padding: 14px;
-    background: rgba(240,240,240,0.03);
-}
-.kpi-title {
-    font-size: 0.85rem;
-    color: #aaaaaa;
-}
-.kpi-value {
-    font-size: 1.4rem;
-    font-weight: 700;
-}
+.kpi { border: 1px solid rgba(200,200,200,0.25); border-radius: 14px; padding: 14px;
+       background: rgba(240,240,240,0.03); }
+.kpi-title { font-size: 0.85rem; color: #aaaaaa; }
+.kpi-value { font-size: 1.4rem; font-weight: 700; }
+.small { color: #aaaaaa; font-size: 0.9rem; }
 </style>
 """, unsafe_allow_html=True)
 
-# --------------------------------------------------
-# Session state (in-memory only)
-# --------------------------------------------------
+# -------------------- Session state --------------------
+TRADES_COLS = [
+    "trade_id", "created_on", "strategy_name", "symbol", "expiry",
+    "qty_lots", "lot_size",
+    "short_put", "long_put", "short_call", "long_call",
+    "entry_sp", "entry_lp", "entry_sc", "entry_lc",
+    "notes"
+]
+DAILY_COLS = ["date", "trade_id", "mtm"]
+
 if "trades" not in st.session_state:
-    st.session_state.trades = pd.DataFrame(columns=[
-        "trade_id", "created_on", "expiry", "strategy",
-        "short_put", "long_put", "short_call", "long_call",
-        "entry_sp", "entry_lp", "entry_sc", "entry_lc",
-        "notes"
-    ])
-
+    st.session_state.trades = pd.DataFrame(columns=TRADES_COLS)
 if "daily" not in st.session_state:
-    st.session_state.daily = pd.DataFrame(columns=[
-        "date", "trade_id", "mtm"
-    ])
-
+    st.session_state.daily = pd.DataFrame(columns=DAILY_COLS)
 if "screenshots" not in st.session_state:
-    st.session_state.screenshots = {}  # trade_id -> image bytes
+    st.session_state.screenshots = {}  # trade_id -> bytes
 
-# --------------------------------------------------
-# NSE Option Chain (unofficial, may fail sometimes)
-# --------------------------------------------------
-def fetch_nse_chain():
-    url = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
+# -------------------- NSE Option Chain (unofficial) --------------------
+def fetch_nse_chain(symbol="NIFTY"):
+    base = "https://www.nseindia.com"
+    url = f"{base}/api/option-chain-indices?symbol={symbol}"
     headers = {
         "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json",
-        "Referer": "https://www.nseindia.com/option-chain"
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.nseindia.com/option-chain",
+        "Connection": "keep-alive",
     }
-    session = requests.Session()
-    session.get("https://www.nseindia.com", headers=headers, timeout=10)
-    r = session.get(url, headers=headers, timeout=10)
+    s = requests.Session()
+    s.get(base, headers=headers, timeout=10)
+    r = s.get(url, headers=headers, timeout=10)
     r.raise_for_status()
     return r.json()
 
 def chain_df(raw, expiry):
     rows = []
-    for d in raw["records"]["data"]:
+    for d in raw.get("records", {}).get("data", []):
         if d.get("expiryDate") == expiry:
             rows.append({
-                "strike": d["strikePrice"],
+                "strike": d.get("strikePrice"),
                 "CE": d.get("CE", {}).get("lastPrice"),
-                "PE": d.get("PE", {}).get("lastPrice")
+                "PE": d.get("PE", {}).get("lastPrice"),
             })
     return pd.DataFrame(rows)
 
@@ -86,188 +67,185 @@ def ltp(df, strike, opt):
     r = df[df["strike"] == strike]
     if r.empty:
         return None
-    return float(r[opt].iloc[0])
+    return float(r[opt].iloc[0]) if pd.notna(r[opt].iloc[0]) else None
 
-def calc_mtm(trade, df):
+def calc_mtm(trade_row, df):
+    # long = +1, short = -1
+    qty = int(trade_row["qty_lots"])
+    lot_size = int(trade_row["lot_size"])
+
     legs = [
-        ("PE", trade["long_put"],  +1, trade["entry_lp"]),
-        ("PE", trade["short_put"], -1, trade["entry_sp"]),
-        ("CE", trade["short_call"],-1, trade["entry_sc"]),
-        ("CE", trade["long_call"], +1, trade["entry_lc"]),
+        ("PE", int(trade_row["long_put"]),  +1, float(trade_row["entry_lp"])),
+        ("PE", int(trade_row["short_put"]), -1, float(trade_row["entry_sp"])),
+        ("CE", int(trade_row["short_call"]),-1, float(trade_row["entry_sc"])),
+        ("CE", int(trade_row["long_call"]), +1, float(trade_row["entry_lc"])),
     ]
 
-    entry_val = 0
-    curr_val = 0
-
-    for opt, strike, sign, entry in legs:
+    entry_val, curr_val = 0.0, 0.0
+    for opt, strike, sign, entry_price in legs:
         price = ltp(df, strike, opt)
         if price is None:
             return None
-        entry_val += sign * entry
-        curr_val += sign * price
+        entry_val += sign * entry_price
+        curr_val  += sign * price
 
-    return (entry_val - curr_val) * 50  # NIFTY lot size
+    pnl_points = (entry_val - curr_val)
+    return pnl_points * lot_size * qty
 
-# --------------------------------------------------
-# Header
-# --------------------------------------------------
+# -------------------- Header --------------------
 st.title("Iron Condor Paper Trading Dashboard")
-st.caption("Simple | Visual | Data-centric | No local storage")
+st.caption("Strategy journal + MTM logging. Auto MTM depends on data availability.")
 
 tabs = st.tabs(["New Trade", "Trade Desk", "Leaderboards"])
 
-# --------------------------------------------------
-# TAB 1 — New Trade
-# --------------------------------------------------
+# -------------------- New Trade --------------------
 with tabs[0]:
-    st.subheader("Create a new trade")
+    st.subheader("Create trade")
 
-    try:
-        raw = fetch_nse_chain()
-        expiries = raw["records"]["expiryDates"]
-        chain_ok = True
-    except Exception:
-        expiries = []
-        chain_ok = False
-        st.warning("Option chain not available right now. You can still enter prices manually.")
+    c1, c2, c3 = st.columns([0.45, 0.25, 0.30])
+    strategy_name = c1.text_input("Strategy name", placeholder="e.g., IC Wide 300/50, Low Risk Theta")
+    symbol = c2.text_input("Symbol", value="NIFTY")
+    expiry = c3.text_input("Expiry (type it)", placeholder="e.g., 06-Feb-2026 (must match chain format if auto MTM)")
 
-    expiry = st.selectbox("Expiry", expiries if expiries else ["N/A"])
-    strategy = st.selectbox("Strategy", ["A", "B", "C"])
+    c4, c5 = st.columns(2)
+    qty_lots = c4.number_input("Quantity (lots)", min_value=1, value=1, step=1)
+    lot_size = c5.number_input("Lot size", min_value=1, value=50, step=1)
 
-    c1, c2, c3, c4 = st.columns(4)
-    short_put = c1.number_input("Short Put", step=50)
-    long_put  = c2.number_input("Long Put", step=50)
-    short_call= c3.number_input("Short Call", step=50)
-    long_call = c4.number_input("Long Call", step=50)
+    st.markdown("### Strikes")
+    s1, s2, s3, s4 = st.columns(4)
+    short_put = s1.number_input("Short Put", step=50)
+    long_put  = s2.number_input("Long Put", step=50)
+    short_call= s3.number_input("Short Call", step=50)
+    long_call = s4.number_input("Long Call", step=50)
 
-    if chain_ok and expiry != "N/A":
-        df = chain_df(raw, expiry)
-        auto_sp = ltp(df, short_put, "PE")
-        auto_lp = ltp(df, long_put, "PE")
-        auto_sc = ltp(df, short_call, "CE")
-        auto_lc = ltp(df, long_call, "CE")
-    else:
-        auto_sp = auto_lp = auto_sc = auto_lc = None
-
+    st.markdown("### Entry prices")
     e1, e2, e3, e4 = st.columns(4)
-    entry_sp = e1.number_input("Entry SP", value=float(auto_sp) if auto_sp else 0.0)
-    entry_lp = e2.number_input("Entry LP", value=float(auto_lp) if auto_lp else 0.0)
-    entry_sc = e3.number_input("Entry SC", value=float(auto_sc) if auto_sc else 0.0)
-    entry_lc = e4.number_input("Entry LC", value=float(auto_lc) if auto_lc else 0.0)
+    entry_sp = e1.number_input("Entry SP (PE)", value=0.0, step=0.05, format="%.2f")
+    entry_lp = e2.number_input("Entry LP (PE)", value=0.0, step=0.05, format="%.2f")
+    entry_sc = e3.number_input("Entry SC (CE)", value=0.0, step=0.05, format="%.2f")
+    entry_lc = e4.number_input("Entry LC (CE)", value=0.0, step=0.05, format="%.2f")
 
-    notes = st.text_area("Notes")
+    notes = st.text_area("Notes", placeholder="IVP/VIX view, rules, why this trade, etc.")
 
     img = st.file_uploader("Upload payoff screenshot (optional)", ["png", "jpg", "jpeg"])
 
     if st.button("Add trade"):
-        trade_id = f"{expiry}_{int(datetime.now().timestamp())}"
-        row = {
-            "trade_id": trade_id,
-            "created_on": str(date.today()),
-            "expiry": expiry,
-            "strategy": strategy,
-            "short_put": int(short_put),
-            "long_put": int(long_put),
-            "short_call": int(short_call),
-            "long_call": int(long_call),
-            "entry_sp": float(entry_sp),
-            "entry_lp": float(entry_lp),
-            "entry_sc": float(entry_sc),
-            "entry_lc": float(entry_lc),
-            "notes": notes
-        }
-        st.session_state.trades = pd.concat(
-            [st.session_state.trades, pd.DataFrame([row])],
-            ignore_index=True
-        )
+        if not strategy_name.strip():
+            st.error("Please enter a strategy name.")
+        elif not expiry.strip():
+            st.error("Please enter expiry text (you can type it).")
+        else:
+            trade_id = f"{symbol}_{int(datetime.now().timestamp())}"
+            row = {
+                "trade_id": trade_id,
+                "created_on": str(date.today()),
+                "strategy_name": strategy_name.strip(),
+                "symbol": symbol.strip(),
+                "expiry": expiry.strip(),
+                "qty_lots": int(qty_lots),
+                "lot_size": int(lot_size),
+                "short_put": int(short_put),
+                "long_put": int(long_put),
+                "short_call": int(short_call),
+                "long_call": int(long_call),
+                "entry_sp": float(entry_sp),
+                "entry_lp": float(entry_lp),
+                "entry_sc": float(entry_sc),
+                "entry_lc": float(entry_lc),
+                "notes": notes
+            }
+            st.session_state.trades = pd.concat([st.session_state.trades, pd.DataFrame([row])], ignore_index=True)
+            if img:
+                st.session_state.screenshots[trade_id] = img.getvalue()
+            st.success("Trade added to journal.")
 
-        if img:
-            st.session_state.screenshots[trade_id] = img.getvalue()
-
-        st.success("Trade added")
-
-# --------------------------------------------------
-# TAB 2 — Trade Desk
-# --------------------------------------------------
+# -------------------- Trade Desk --------------------
 with tabs[1]:
-    if st.session_state.trades.empty:
-        st.info("No trades yet")
+    trades = st.session_state.trades
+    if trades.empty:
+        st.info("No trades yet. Add one in 'New Trade'.")
     else:
         pick = st.selectbox(
             "Select trade",
-            st.session_state.trades["trade_id"]
+            trades["trade_id"].tolist(),
+            format_func=lambda tid: f"{trades.loc[trades.trade_id==tid, 'strategy_name'].iloc[0]}  |  {tid}"
         )
-        t = st.session_state.trades[
-            st.session_state.trades["trade_id"] == pick
-        ].iloc[0]
+        t = trades[trades["trade_id"] == pick].iloc[0]
 
-        col1, col2 = st.columns([1, 1])
+        left, right = st.columns([1, 1])
 
-        with col1:
+        with left:
+            st.markdown("#### Screenshot")
             if pick in st.session_state.screenshots:
-                st.image(
-                    Image.open(BytesIO(st.session_state.screenshots[pick])),
-                    use_container_width=True
-                )
-            st.write("Notes:")
-            st.write(t["notes"] if t["notes"] else "-")
+                st.image(Image.open(BytesIO(st.session_state.screenshots[pick])), use_container_width=True)
+            else:
+                st.caption("No screenshot stored for this trade.")
 
-        with col2:
+            st.markdown("#### Notes")
+            st.write(t["notes"] if str(t["notes"]).strip() else "-")
+
+        with right:
+            st.markdown("#### Live MTM (auto if chain works)")
+            mtm = None
+            auto_error = None
             try:
-                raw = fetch_nse_chain()
+                raw = fetch_nse_chain(symbol=t["symbol"])
                 df = chain_df(raw, t["expiry"])
-                mtm = calc_mtm(t, df)
-            except Exception:
-                mtm = None
+                if df.empty:
+                    auto_error = "Expiry format does not match chain. Try the exact NSE expiry text (e.g., '06-Feb-2026')."
+                else:
+                    mtm = calc_mtm(t, df)
+                    if mtm is None:
+                        auto_error = "Could not find one or more strikes in the option chain for this expiry."
+            except Exception as e:
+                auto_error = f"Chain fetch failed (common on cloud): {e}"
 
             if mtm is not None:
-                st.markdown(f"""
-                <div class="kpi">
-                    <div class="kpi-title">MTM (INR)</div>
-                    <div class="kpi-value">{int(mtm):,}</div>
-                </div>
-                """, unsafe_allow_html=True)
+                st.markdown(
+                    f"<div class='kpi'><div class='kpi-title'>MTM (INR)</div><div class='kpi-value'>{int(mtm):,}</div></div>",
+                    unsafe_allow_html=True
+                )
             else:
-                st.warning("Auto MTM unavailable")
+                st.warning("Auto MTM unavailable right now.")
+                if auto_error:
+                    st.caption(auto_error)
 
-            manual = st.number_input("Manual MTM", value=0.0)
-            use_manual = st.checkbox("Use manual MTM", value=(mtm is None))
+            st.markdown("#### Log today")
+            manual_mtm = st.number_input("Manual MTM (INR)", value=0.0, step=100.0)
+            use_manual = st.checkbox("Use manual MTM for logging", value=(mtm is None))
 
-            if st.button("Log today"):
-                log_val = manual if use_manual else mtm
-                st.session_state.daily = pd.concat([
-                    st.session_state.daily,
-                    pd.DataFrame([{
-                        "date": str(date.today()),
-                        "trade_id": pick,
-                        "mtm": log_val
-                    }])
-                ], ignore_index=True)
-                st.success("Logged")
+            if st.button("Log MTM for today"):
+                log_val = float(manual_mtm) if use_manual else float(mtm)
+                st.session_state.daily = pd.concat([st.session_state.daily, pd.DataFrame([{
+                    "date": str(date.today()),
+                    "trade_id": pick,
+                    "mtm": log_val
+                }])], ignore_index=True)
+                st.success("Logged.")
 
-        hist = st.session_state.daily[
-            st.session_state.daily["trade_id"] == pick
-        ]
-        if not hist.empty:
-            hist["date"] = pd.to_datetime(hist["date"])
-            st.line_chart(hist.set_index("date")["mtm"])
+            hist = st.session_state.daily[st.session_state.daily["trade_id"] == pick].copy()
+            if not hist.empty:
+                hist["date"] = pd.to_datetime(hist["date"])
+                hist = hist.sort_values("date")
+                st.line_chart(hist.set_index("date")["mtm"])
 
-# --------------------------------------------------
-# TAB 3 — Leaderboards
-# --------------------------------------------------
+# -------------------- Leaderboards --------------------
 with tabs[2]:
-    if st.session_state.daily.empty:
-        st.info("No daily logs yet")
-    else:
-        latest = (
-            st.session_state.daily
-            .sort_values("date")
-            .groupby("trade_id")
-            .tail(1)
-        )
-        st.subheader("Top performers (latest MTM)")
-        st.dataframe(
-            latest.sort_values("mtm", ascending=False),
-            use_container_width=True
-        )
+    daily = st.session_state.daily.copy()
+    trades = st.session_state.trades.copy()
 
+    if daily.empty:
+        st.info("No logs yet. Log daily MTM to see leaderboards.")
+    else:
+        daily["date"] = pd.to_datetime(daily["date"])
+        latest = daily.sort_values("date").groupby("trade_id").tail(1)
+        latest = latest.merge(trades[["trade_id","strategy_name","expiry"]], on="trade_id", how="left")
+
+        c1, c2, c3 = st.columns(3)
+        c1.markdown(f"<div class='kpi'><div class='kpi-title'>Trades tracked</div><div class='kpi-value'>{trades.shape[0]}</div></div>", unsafe_allow_html=True)
+        c2.markdown(f"<div class='kpi'><div class='kpi-title'>Logs recorded</div><div class='kpi-value'>{daily.shape[0]}</div></div>", unsafe_allow_html=True)
+        c3.markdown(f"<div class='kpi'><div class='kpi-title'>Top MTM (latest)</div><div class='kpi-value'>{int(latest['mtm'].max()):,}</div></div>", unsafe_allow_html=True)
+
+        st.markdown("#### Top performers (latest MTM)")
+        show = latest.sort_values("mtm", ascending=False)[["strategy_name","expiry","date","mtm","trade_id"]]
+        st.dataframe(show, use_container_width=True, height=420)
