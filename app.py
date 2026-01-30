@@ -1,13 +1,14 @@
 import base64
 from io import BytesIO
-from datetime import date, datetime
-from pathlib import Path
+from datetime import date
 from uuid import uuid4
 
 import pandas as pd
 import streamlit as st
 import altair as alt
 from PIL import Image
+
+from supabase import create_client, Client
 
 
 # --------------------------
@@ -35,87 +36,45 @@ hr { border: none; height: 1px; background: rgba(255,255,255,0.1); margin: 16px 
 )
 
 st.title("Options Strategy Journal (EOD)")
-st.caption("Persistent storage: auto-load + auto-save to data/*.csv (local persistent; cloud depends on host)")
+st.caption("Persistent storage: Supabase Postgres (data) + Supabase Storage (screenshots)")
+
 
 # --------------------------
 # Data Model
 # --------------------------
 TEMPLATE_COLS = ["template_id", "template_name", "strategy_type", "underlying", "rules_notes"]
-
 RUN_COLS = [
     "run_id", "template_id", "run_name", "status",
     "entry_date", "expiry", "entry_spot",
     "qty_lots", "lot_size", "margin_used",
     "short_put", "long_put", "short_call", "long_call",
-    "screenshot_b64",
-    # close / square-off
+    "screenshot_url",
     "close_date", "close_spot", "close_mtm_inr", "close_notes"
 ]
-
 LOG_COLS = ["log_id", "run_id", "date", "mtm_inr", "nifty_level", "notes"]
 
+
 # --------------------------
-# Storage (auto-save)
+# Supabase init
 # --------------------------
-APP_DIR = Path(__file__).parent if "__file__" in globals() else Path.cwd()
-DATA_DIR = APP_DIR / "data"
-TEMPLATES_PATH = DATA_DIR / "templates.csv"
-RUNS_PATH = DATA_DIR / "runs.csv"
-LOGS_PATH = DATA_DIR / "logs.csv"
+@st.cache_resource
+def get_supabase() -> Client:
+    url = st.secrets.get("SUPABASE_URL")
+    key = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY")
+    if not url or not key:
+        st.error("Missing Supabase secrets. Add SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in Streamlit secrets.")
+        st.stop()
+    return create_client(url, key)
 
-def ensure_cols(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-    if df is None:
-        return pd.DataFrame(columns=cols)
-    for c in cols:
-        if c not in df.columns:
-            df[c] = None
-    return df[cols]
+supabase = get_supabase()
+BUCKET = st.secrets.get("SUPABASE_BUCKET", "journal-screens")
 
-def load_csv(path: Path, cols: list[str]) -> pd.DataFrame:
-    if not path.exists():
-        return pd.DataFrame(columns=cols)
-    try:
-        df = pd.read_csv(path, dtype=str)  # keep raw strings; we cast later
-        return ensure_cols(df, cols)
-    except Exception:
-        return pd.DataFrame(columns=cols)
-
-def atomic_write_csv(df: pd.DataFrame, path: Path):
-    tmp = path.with_suffix(".tmp")
-    df.to_csv(tmp, index=False)
-    tmp.replace(path)
-
-def save_all():
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    atomic_write_csv(st.session_state.templates, TEMPLATES_PATH)
-    atomic_write_csv(st.session_state.runs, RUNS_PATH)
-    atomic_write_csv(st.session_state.logs, LOGS_PATH)
 
 # --------------------------
 # Helpers
 # --------------------------
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex[:12]}"
-
-def img_to_b64(uploaded) -> str:
-    if uploaded is None:
-        return ""
-    return base64.b64encode(uploaded.getvalue()).decode("utf-8")
-
-def b64_to_img(b64_str: str):
-    if not b64_str:
-        return None
-    try:
-        raw = base64.b64decode(b64_str)
-        return Image.open(BytesIO(raw))
-    except Exception:
-        return None
-
-def to_date_str(d: date) -> str:
-    return d.isoformat()
-
-def parse_date(x) -> pd.Timestamp:
-    return pd.to_datetime(x, errors="coerce")
 
 def to_float(x, default=0.0) -> float:
     try:
@@ -133,74 +92,11 @@ def to_int(x, default=0) -> int:
     except Exception:
         return int(default)
 
-# --------------------------
-# Init session state (LOAD ON START)
-# --------------------------
-if "booted" not in st.session_state:
-    st.session_state.templates = load_csv(TEMPLATES_PATH, TEMPLATE_COLS)
-    st.session_state.runs = load_csv(RUNS_PATH, RUN_COLS)
-    st.session_state.logs = load_csv(LOGS_PATH, LOG_COLS)
-    st.session_state.booted = True
+def to_date_str(d: date) -> str:
+    return d.isoformat()
 
-# --------------------------
-# Normalize + backward compatibility
-# --------------------------
-def normalize_state():
-    st.session_state.templates = ensure_cols(st.session_state.templates, TEMPLATE_COLS)
-    st.session_state.runs = ensure_cols(st.session_state.runs, RUN_COLS)
-
-    logs = st.session_state.logs.copy()
-    # old schema renames
-    if "strategy_id" in logs.columns and "run_id" not in logs.columns:
-        logs = logs.rename(columns={"strategy_id": "run_id"})
-    if "day_pnl_inr" in logs.columns and "mtm_inr" not in logs.columns:
-        logs = logs.rename(columns={"day_pnl_inr": "mtm_inr"})
-    if "spot_close" in logs.columns and "nifty_level" not in logs.columns:
-        logs = logs.rename(columns={"spot_close": "nifty_level"})
-
-    st.session_state.logs = ensure_cols(logs, LOG_COLS)
-
-    # date normalization to ISO strings (prevents duplicate-check bugs)
-    if not st.session_state.logs.empty:
-        st.session_state.logs["date"] = (
-            pd.to_datetime(st.session_state.logs["date"], errors="coerce")
-            .dt.date
-            .astype(str)
-        )
-
-normalize_state()
-
-# --------------------------
-# Analytics
-# --------------------------
-def run_logs_df(run_id: str) -> pd.DataFrame:
-    logs = st.session_state.logs
-    if logs is None or logs.empty:
-        return pd.DataFrame(columns=LOG_COLS)
-
-    df = logs[logs["run_id"] == run_id].copy()
-    if df.empty:
-        return df
-
-    df["date_ts"] = parse_date(df["date"])
-    df = df.dropna(subset=["date_ts"]).sort_values("date_ts")
-
-    df["mtm_inr"] = pd.to_numeric(df["mtm_inr"], errors="coerce").fillna(0.0)
-    df["nifty_level"] = pd.to_numeric(df["nifty_level"], errors="coerce")
-
-    df["day_change"] = df["mtm_inr"].diff().fillna(df["mtm_inr"])
-    df["peak"] = df["mtm_inr"].cummax()
-    df["drawdown"] = df["mtm_inr"] - df["peak"]
-    return df
-
-def run_kpis(run_row: pd.Series, df: pd.DataFrame) -> dict:
-    margin = to_float(run_row.get("margin_used", 0), 0.0)
-    if df is None or df.empty:
-        return dict(days=0, latest_mtm=0.0, profit_pct=0.0, max_dd=0.0)
-    latest = float(df["mtm_inr"].iloc[-1])
-    profit_pct = (latest / margin * 100.0) if margin else 0.0
-    max_dd = float(df["drawdown"].min()) if "drawdown" in df.columns else 0.0
-    return dict(days=int(df.shape[0]), latest_mtm=latest, profit_pct=profit_pct, max_dd=max_dd)
+def parse_date(x):
+    return pd.to_datetime(x, errors="coerce")
 
 def line_chart(df: pd.DataFrame, x: str, y: str, height: int = 260, title: str = ""):
     if df.empty:
@@ -234,6 +130,128 @@ def bar_chart(df: pd.DataFrame, x: str, y: str, height: int = 260, title: str = 
     )
     st.altair_chart(chart, use_container_width=True)
 
+def df_from_rows(rows, cols):
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    df = pd.DataFrame(rows)
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+    return df[cols]
+
+
+# --------------------------
+# DB I/O
+# --------------------------
+def db_load(table: str, cols: list[str]) -> pd.DataFrame:
+    try:
+        res = supabase.table(table).select("*").execute()
+        rows = res.data or []
+        return df_from_rows(rows, cols)
+    except Exception as e:
+        st.error(f"DB load failed for {table}: {e}")
+        return pd.DataFrame(columns=cols)
+
+def db_upsert_df(table: str, df: pd.DataFrame):
+    if df is None or df.empty:
+        return
+    try:
+        # Convert NaN to None for JSON
+        payload = df.where(pd.notnull(df), None).to_dict(orient="records")
+        supabase.table(table).upsert(payload).execute()
+    except Exception as e:
+        st.error(f"DB upsert failed for {table}: {e}")
+
+def db_delete(table: str, col: str, value: str):
+    try:
+        supabase.table(table).delete().eq(col, value).execute()
+    except Exception as e:
+        st.error(f"DB delete failed for {table}: {e}")
+
+
+# --------------------------
+# Storage I/O (screenshots)
+# --------------------------
+def upload_screenshot(file, run_id: str) -> str:
+    """
+    Uploads screenshot to Supabase Storage and returns a public URL.
+    Uses a deterministic-ish path so replacing is easy.
+    """
+    if file is None:
+        return ""
+
+    ext = file.name.split(".")[-1].lower()
+    if ext not in ("png", "jpg", "jpeg", "webp"):
+        ext = "png"
+
+    path = f"{run_id}/payoff.{ext}"
+    data = file.getvalue()
+
+    try:
+        # upload (upsert=True replaces existing)
+        supabase.storage.from_(BUCKET).upload(
+            path=path,
+            file=data,
+            file_options={"content-type": file.type, "upsert": "true"},
+        )
+
+        # public URL
+        public = supabase.storage.from_(BUCKET).get_public_url(path)
+        return public
+    except Exception as e:
+        st.error(f"Screenshot upload failed: {e}")
+        return ""
+
+def show_image_from_url(url: str):
+    if not url or not str(url).strip():
+        st.caption("No screenshot for this run.")
+        return
+    st.image(url, use_container_width=True)
+
+
+# --------------------------
+# Init session state (LOAD ON START)
+# --------------------------
+if "booted" not in st.session_state:
+    st.session_state.templates = db_load("templates", TEMPLATE_COLS)
+    st.session_state.runs = db_load("runs", RUN_COLS)
+    st.session_state.logs = db_load("logs", LOG_COLS)
+    st.session_state.booted = True
+
+
+# --------------------------
+# Analytics
+# --------------------------
+def run_logs_df(run_id: str) -> pd.DataFrame:
+    logs = st.session_state.logs
+    if logs is None or logs.empty:
+        return pd.DataFrame(columns=LOG_COLS)
+
+    df = logs[logs["run_id"] == run_id].copy()
+    if df.empty:
+        return df
+
+    df["date_ts"] = parse_date(df["date"])
+    df = df.dropna(subset=["date_ts"]).sort_values("date_ts")
+
+    df["mtm_inr"] = pd.to_numeric(df["mtm_inr"], errors="coerce").fillna(0.0)
+    df["nifty_level"] = pd.to_numeric(df["nifty_level"], errors="coerce")
+
+    df["day_change"] = df["mtm_inr"].diff().fillna(df["mtm_inr"])
+    df["peak"] = df["mtm_inr"].cummax()
+    df["drawdown"] = df["mtm_inr"] - df["peak"]
+    return df
+
+def run_kpis(run_row: pd.Series, df: pd.DataFrame) -> dict:
+    margin = to_float(run_row.get("margin_used", 0), 0.0)
+    if df is None or df.empty:
+        return dict(days=0, latest_mtm=0.0, profit_pct=0.0, max_dd=0.0)
+    latest = float(df["mtm_inr"].iloc[-1])
+    profit_pct = (latest / margin * 100.0) if margin else 0.0
+    max_dd = float(df["drawdown"].min()) if "drawdown" in df.columns else 0.0
+    return dict(days=int(df.shape[0]), latest_mtm=latest, profit_pct=profit_pct, max_dd=max_dd)
+
+
 # --------------------------
 # Sidebar Navigation
 # --------------------------
@@ -241,10 +259,11 @@ with st.sidebar:
     st.header("Navigation")
     page = st.radio(
         "Go to",
-        ["Dashboard", "Run Desk", "Create Template", "Create Run", "Backup / Restore"],
+        ["Dashboard", "Run Desk", "Create Template", "Create Run", "Sync / Reload"],
         index=0,
     )
-    st.caption("Auto-saves to data/*.csv")
+    st.caption("Persistence: Supabase DB + Storage")
+
 
 # --------------------------
 # Pages
@@ -267,7 +286,6 @@ def page_dashboard():
         st.info("Create a template and a run to start journaling.")
         return
 
-    # Build performance table
     rows = []
     for _, r in runs.iterrows():
         df = run_logs_df(r["run_id"])
@@ -289,7 +307,6 @@ def page_dashboard():
         on="template_id",
         how="left",
     )
-
     perf["label"] = perf["template_name"].fillna("Unknown") + " | Exp: " + perf["expiry"].fillna("-") + " | " + perf["status"].fillna("-")
 
     st.markdown("### Top runs by Profit %")
@@ -323,8 +340,8 @@ def page_create_template():
             rules_notes=rules_notes.strip(),
         )
         st.session_state.templates = pd.concat([st.session_state.templates, pd.DataFrame([row])], ignore_index=True)
-        save_all()
-        st.success("Template created and saved.")
+        db_upsert_df("templates", st.session_state.templates)
+        st.success("Template created and saved (Supabase).")
 
 def page_create_run():
     st.subheader("Create Run")
@@ -362,7 +379,7 @@ def page_create_run():
     short_call = s3.text_input("Short Call")
     long_call = s4.text_input("Long Call")
 
-    shot = st.file_uploader("Upload payoff/graph screenshot", type=["png", "jpg", "jpeg"])
+    shot = st.file_uploader("Upload payoff/graph screenshot", type=["png", "jpg", "jpeg", "webp"])
 
     st.markdown("---")
     st.markdown("### (Optional) If already closed, add square-off details")
@@ -376,7 +393,10 @@ def page_create_run():
         if margin_used <= 0:
             st.error("Margin used must be > 0.")
             return
+
         rid = new_id("RUN")
+        screenshot_url = upload_screenshot(shot, rid) if shot is not None else ""
+
         row = dict(
             run_id=rid,
             template_id=tid,
@@ -392,15 +412,16 @@ def page_create_run():
             long_put=long_put.strip(),
             short_call=short_call.strip(),
             long_call=long_call.strip(),
-            screenshot_b64=img_to_b64(shot),
-            close_date=to_date_str(close_date) if status == "CLOSED" else "",
-            close_spot=float(close_spot) if status == "CLOSED" else "",
-            close_mtm_inr=float(close_mtm) if status == "CLOSED" else "",
-            close_notes=close_notes.strip() if status == "CLOSED" else "",
+            screenshot_url=screenshot_url,
+            close_date=to_date_str(close_date) if status == "CLOSED" else None,
+            close_spot=float(close_spot) if status == "CLOSED" else None,
+            close_mtm_inr=float(close_mtm) if status == "CLOSED" else None,
+            close_notes=close_notes.strip() if status == "CLOSED" else None,
         )
+
         st.session_state.runs = pd.concat([st.session_state.runs, pd.DataFrame([row])], ignore_index=True)
-        save_all()
-        st.success("Run created and saved.")
+        db_upsert_df("runs", st.session_state.runs)
+        st.success("Run created and saved (Supabase).")
 
 def page_run_desk():
     st.subheader("Run Desk")
@@ -456,17 +477,14 @@ def page_run_desk():
 
     with left:
         st.markdown("### Screenshot")
-        img = b64_to_img(r.get("screenshot_b64", ""))
-        if img is not None:
-            st.image(img, use_container_width=True)
-        else:
-            st.caption("No screenshot for this run.")
+        show_image_from_url(str(r.get("screenshot_url", "") or ""))
 
-        new_shot = st.file_uploader("Upload/replace screenshot", type=["png", "jpg", "jpeg"], key="replace")
+        new_shot = st.file_uploader("Upload/replace screenshot", type=["png", "jpg", "jpeg", "webp"], key="replace")
         if new_shot is not None and st.button("Save screenshot"):
-            st.session_state.runs.loc[st.session_state.runs["run_id"] == pick, "screenshot_b64"] = img_to_b64(new_shot)
-            save_all()
-            st.success("Saved.")
+            url = upload_screenshot(new_shot, pick)
+            st.session_state.runs.loc[st.session_state.runs["run_id"] == pick, "screenshot_url"] = url
+            db_upsert_df("runs", st.session_state.runs)
+            st.success("Saved (Supabase Storage).")
 
     with mid:
         st.markdown("### Run details")
@@ -504,17 +522,17 @@ def page_run_desk():
                 idx = st.session_state.runs["run_id"] == pick
                 st.session_state.runs.loc[idx, "status"] = "CLOSED"
                 st.session_state.runs.loc[idx, "close_date"] = to_date_str(close_date)
-                st.session_state.runs.loc[idx, "close_spot"] = str(float(close_spot))
-                st.session_state.runs.loc[idx, "close_mtm_inr"] = str(float(close_mtm))
+                st.session_state.runs.loc[idx, "close_spot"] = float(close_spot)
+                st.session_state.runs.loc[idx, "close_mtm_inr"] = float(close_mtm)
                 st.session_state.runs.loc[idx, "close_notes"] = close_notes.strip()
-                save_all()
-                st.success("Run marked CLOSED and square-off saved.")
+                db_upsert_df("runs", st.session_state.runs)
+                st.success("Run marked CLOSED and square-off saved (Supabase).")
         with cbtn2:
             if st.button("Re-open (set ACTIVE)"):
                 idx = st.session_state.runs["run_id"] == pick
                 st.session_state.runs.loc[idx, "status"] = "ACTIVE"
-                save_all()
-                st.success("Run set to ACTIVE.")
+                db_upsert_df("runs", st.session_state.runs)
+                st.success("Run set to ACTIVE (Supabase).")
 
         if str(r.get("status", "")).upper() == "CLOSED":
             st.markdown("**Saved square-off (last close):**")
@@ -532,36 +550,35 @@ def page_run_desk():
         nifty_level = st.number_input("NIFTY close", step=1.0, key="nifty_close")
         notes = st.text_area("Notes", height=120, key="notes")
 
-        # robust duplicate check (compare ISO string)
         log_date_str = to_date_str(log_date)
-        existing = st.session_state.logs[
-            (st.session_state.logs["run_id"] == pick) &
-            (st.session_state.logs["date"] == log_date_str)
-        ]
 
         if st.button("Save log"):
-            if not existing.empty:
-                st.error("This date is already logged for this run. Delete that entry first to replace it.")
-            else:
-                row = dict(
-                    log_id=new_id("LOG"),
-                    run_id=pick,
-                    date=log_date_str,
-                    mtm_inr=str(float(mtm)),
-                    nifty_level=str(float(nifty_level)),
-                    notes=notes.strip()
-                )
-                st.session_state.logs = pd.concat([st.session_state.logs, pd.DataFrame([row])], ignore_index=True)
-                normalize_state()
-                save_all()
-                st.success("Saved log.")
+            # DB enforces unique (run_id, date). We handle error cleanly.
+            row = dict(
+                log_id=new_id("LOG"),
+                run_id=pick,
+                date=log_date_str,
+                mtm_inr=float(mtm),
+                nifty_level=float(nifty_level),
+                notes=notes.strip()
+            )
+            try:
+                supabase.table("logs").insert(row).execute()
+                # refresh local logs
+                st.session_state.logs = db_load("logs", LOG_COLS)
+                st.success("Saved log (Supabase).")
+            except Exception:
+                st.error("This date is already logged for this run. Delete it first to replace it.")
 
         st.markdown("---")
         if st.button("Delete this run (and its logs)"):
-            st.session_state.runs = st.session_state.runs[st.session_state.runs["run_id"] != pick].reset_index(drop=True)
-            st.session_state.logs = st.session_state.logs[st.session_state.logs["run_id"] != pick].reset_index(drop=True)
-            save_all()
-            st.warning("Run deleted.")
+            # logs cascade delete because FK on logs(run_id) has ON DELETE CASCADE
+            db_delete("runs", "run_id", pick)
+
+            # refresh local state
+            st.session_state.runs = db_load("runs", RUN_COLS)
+            st.session_state.logs = db_load("logs", LOG_COLS)
+            st.warning("Run deleted (Supabase).")
             st.stop()
 
     st.markdown("---")
@@ -569,7 +586,6 @@ def page_run_desk():
         st.info("No logs yet for this run.")
         return
 
-    # Charts
     c1, c2, c3 = st.columns(3)
     with c1:
         st.markdown("### MTM (Equity Curve)")
@@ -599,37 +615,16 @@ def page_run_desk():
         height=320,
     )
 
-def page_backup_restore():
-    st.subheader("Backup / Restore")
-    st.write("Auto-save is enabled. This is just extra backup/manual import.")
+def page_sync_reload():
+    st.subheader("Sync / Reload")
+    st.write("If you ever feel the UI is stale, reload from Supabase.")
 
-    c1, c2, c3 = st.columns(3)
-    c1.download_button("Download templates.csv",
-                       st.session_state.templates.to_csv(index=False).encode("utf-8"),
-                       file_name="templates.csv")
-    c2.download_button("Download runs.csv",
-                       st.session_state.runs.to_csv(index=False).encode("utf-8"),
-                       file_name="runs.csv")
-    c3.download_button("Download logs.csv",
-                       st.session_state.logs.to_csv(index=False).encode("utf-8"),
-                       file_name="logs.csv")
+    if st.button("Reload everything from Supabase"):
+        st.session_state.templates = db_load("templates", TEMPLATE_COLS)
+        st.session_state.runs = db_load("runs", RUN_COLS)
+        st.session_state.logs = db_load("logs", LOG_COLS)
+        st.success("Reloaded.")
 
-    st.markdown("### Import")
-    u1, u2, u3 = st.columns(3)
-    up_t = u1.file_uploader("Upload templates.csv", type=["csv"])
-    up_r = u2.file_uploader("Upload runs.csv", type=["csv"])
-    up_l = u3.file_uploader("Upload logs.csv", type=["csv"])
-
-    if st.button("Import CSVs"):
-        if up_t is not None:
-            st.session_state.templates = ensure_cols(pd.read_csv(up_t, dtype=str), TEMPLATE_COLS)
-        if up_r is not None:
-            st.session_state.runs = ensure_cols(pd.read_csv(up_r, dtype=str), RUN_COLS)
-        if up_l is not None:
-            st.session_state.logs = ensure_cols(pd.read_csv(up_l, dtype=str), LOG_COLS)
-        normalize_state()
-        save_all()
-        st.success("Imported + saved to data/.")
 
 # --------------------------
 # Router
@@ -643,4 +638,4 @@ elif page == "Create Template":
 elif page == "Create Run":
     page_create_run()
 else:
-    page_backup_restore()
+    page_sync_reload()
