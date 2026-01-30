@@ -1,4 +1,7 @@
 streamlit
 pandas
-requests
+altair
 Pillow
+supabase
+python-dateutil
+
